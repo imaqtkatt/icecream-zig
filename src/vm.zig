@@ -40,10 +40,12 @@ const VmStack = struct {
     stack: std.ArrayList(value.Value),
 
     pub fn init(allocator: std.mem.Allocator, locals: usize) VmStack {
+        var stack = std.ArrayList(value.Value).init(allocator);
+        stack.appendNTimes(value.Value.INT_ZERO, locals) catch @panic("Out of memory");
         return VmStack{
             .stack_base = locals,
             .local_base = 0,
-            .stack = std.ArrayList(value.Value).init(allocator),
+            .stack = stack,
         };
     }
 
@@ -110,6 +112,18 @@ const Frame = struct {
     prototype: *value.Prototype,
 };
 
+const Cmp = enum(u8) { LT, EQ, GT };
+
+fn compare(comptime T: type, a: T, b: T) Cmp {
+    if (a > b) {
+        return Cmp.GT;
+    } else if (a < b) {
+        return Cmp.LT;
+    } else {
+        return Cmp.EQ;
+    }
+}
+
 pub const Machine = struct {
     ip: usize,
     prototype: *value.Prototype,
@@ -158,7 +172,7 @@ pub const Machine = struct {
 
     fn step(self: *Machine, stack: *VmStack) !TaggedContinuation {
         const ins = self.fetch();
-        std.debug.print("ins = {}\n", .{ins});
+        std.debug.print("ins = {s}\n", .{bytecode.TO_STRING[ins]});
         switch (ins) {
             bytecode.RETURN => {
                 if (self.frames.items.len == 0) {
@@ -183,10 +197,22 @@ pub const Machine = struct {
                 const rhs = stack.pop();
                 const lhs = stack.pop();
 
-                _ = rhs;
-                _ = lhs;
+                if (lhs.is_int() and rhs.is_int()) {
+                    const x = lhs.get_int();
+                    const y = rhs.get_int();
+                    try stack.push(value.Value.new_int(x + y));
+                    std.debug.print("push = {}\n", .{stack.stack});
+                    return Continuation.Continue;
+                } else if (lhs.is_number() and rhs.is_number()) {
+                    const x = lhs.get_f64();
+                    const y = rhs.get_f64();
+                    try stack.push(value.Value.from_f64(x + y));
+                    std.debug.print("push = {}\n", .{stack.stack});
+                    return Continuation.Continue;
+                } else {
+                    return TaggedContinuation{ .Error = .TypeError };
+                }
 
-                try stack.push(value.Value.from_f64(42));
                 return Continuation.Continue;
             },
             bytecode.SUB => {
@@ -197,6 +223,12 @@ pub const Machine = struct {
                     const x = lhs.get_int();
                     const y = rhs.get_int();
                     try stack.push(value.Value.new_int(x - y));
+                    std.debug.print("push = {}\n", .{stack.stack});
+                    return Continuation.Continue;
+                } else if (lhs.is_number() and rhs.is_number()) {
+                    const x = lhs.get_f64();
+                    const y = rhs.get_f64();
+                    try stack.push(value.Value.from_f64(x - y));
                     std.debug.print("push = {}\n", .{stack.stack});
                     return Continuation.Continue;
                 } else {
@@ -220,20 +252,89 @@ pub const Machine = struct {
                     const closure = callee.get_closure();
                     const arity = closure.*.prototype.arity;
                     const locals = closure.*.prototype.locals;
-                    std.debug.assert(arity == argc);
-                    const frame_info = try stack.push_frame(locals);
+                    switch (compare(u8, argc, arity)) {
+                        .EQ => {
+                            const frame_info = try stack.push_frame(locals);
 
-                    for (0..arity) |index| {
-                        stack.store(index, arguments[index]);
+                            @memcpy(stack.stack.items[stack.local_base..], arguments);
+                            // for (0..arity) |index| {
+                            //     stack.store(index, arguments[index]);
+                            // }
+
+                            try self.frames.append(Frame{
+                                .ip = ptr.replace(usize, &self.ip, 0),
+                                .prototype = ptr.replace(*value.Prototype, &self.prototype, closure.prototype),
+                                .frame_info = frame_info,
+                            });
+
+                            return Continuation.Continue;
+                        },
+                        .LT => {
+                            std.debug.print("here closure LT\n", .{});
+                            const allocator = self.allocator.allocator();
+                            const partial = try allocator.create(value.Partial);
+                            partial.* = value.Partial{
+                                .arity = arity,
+                                .applied = argc,
+                                .prototype = closure.prototype,
+                                .applied_values = std.ArrayList(value.Value).init(allocator),
+                            };
+
+                            // try partial.applied_values.ensureTotalCapacity(arguments.len);
+                            try partial.applied_values.appendSlice(arguments);
+                            // @memcpy(partial.applied_values.items[0..argc], arguments);
+
+                            const v = value.Value.new_partial(partial);
+                            try stack.push(v);
+
+                            return Continuation.Continue;
+                        },
+                        .GT => {
+                            return TaggedContinuation{ .Error = .ArityError };
+                        },
                     }
+                } else if (callee.is_partial()) {
+                    const partial = callee.get_partial();
+                    const arity = partial.arity;
+                    const applied = partial.applied;
+                    const new_applied = applied + argc;
 
-                    try self.frames.append(Frame{
-                        .ip = ptr.replace(usize, &self.ip, 0),
-                        .prototype = ptr.replace(*value.Prototype, &self.prototype, closure.prototype),
-                        .frame_info = frame_info,
-                    });
+                    switch (compare(u8, new_applied, arity)) {
+                        .GT => return TaggedContinuation{ .Error = .ArityError },
+                        .EQ => {
+                            std.debug.print("here partial EQ", .{});
+                            var applied_values = try partial.applied_values.clone();
+                            try applied_values.appendSlice(arguments);
 
-                    return Continuation.Continue;
+                            const frame_info = try stack.push_frame(partial.prototype.locals);
+                            @memcpy(stack.stack.items[stack.local_base..], applied_values.items);
+
+                            try self.frames.append(Frame{
+                                .ip = ptr.replace(usize, &self.ip, 0),
+                                .frame_info = frame_info,
+                                .prototype = ptr.replace(*value.Prototype, &self.prototype, partial.prototype),
+                            });
+
+                            return Continuation.Continue;
+                        },
+                        .LT => {
+                            var applied_values = try partial.applied_values.clone();
+                            try applied_values.appendSlice(arguments);
+                            const allocator = self.allocator.allocator();
+
+                            const new_partial = try allocator.create(value.Partial);
+                            new_partial.* = value.Partial{
+                                .arity = arity,
+                                .applied = new_applied,
+                                .prototype = partial.prototype,
+                                .applied_values = applied_values,
+                            };
+                            const partial_value = value.Value.new_partial(new_partial);
+                            try stack.push(partial_value);
+
+                            return Continuation.Continue;
+                        },
+                    }
                 } else {
                     return TaggedContinuation{ .Error = .TypeError };
                 }
@@ -254,6 +355,40 @@ pub const Machine = struct {
                 try stack.push(stack.load(3));
                 return Continuation.Continue;
             },
+            bytecode.LOAD_CONST => {
+                const index = self.read_u16();
+                const v = self.prototype.constants.items[index];
+                switch (v) {
+                    .Number => {
+                        try stack.push(value.Value.from_f64(v.Number));
+                    },
+                }
+                return Continuation.Continue;
+            },
+            bytecode.STORE_0 => {
+                stack.store(0, stack.pop());
+                return Continuation.Continue;
+            },
+            bytecode.STORE_1 => {
+                stack.store(1, stack.pop());
+                return Continuation.Continue;
+            },
+            bytecode.STORE_2 => {
+                stack.store(2, stack.pop());
+                return Continuation.Continue;
+            },
+            bytecode.STORE_3 => {
+                stack.store(3, stack.pop());
+                return Continuation.Continue;
+            },
+            bytecode.LOAD_N => {
+                std.debug.print("todo", .{});
+                return TaggedContinuation{ .Error = .InvalidInstruction };
+            },
+            bytecode.STORE_N => {
+                std.debug.print("todo", .{});
+                return TaggedContinuation{ .Error = .InvalidInstruction };
+            },
             else => {
                 std.debug.assert(false);
                 return TaggedContinuation{ .Error = .InvalidInstruction };
@@ -269,14 +404,24 @@ test "aaaa" {
     const prototype = value.Prototype.init(allocator);
     defer prototype.deinit(allocator);
     prototype.*.arity = 0;
-    prototype.*.locals = 0;
-    try prototype.*.chunk.append(bytecode.ICONST_0);
-    try prototype.*.chunk.append(bytecode.ICONST_1);
+    prototype.*.locals = 1;
+    try prototype.*.constants.append(.{ .Number = 42 });
+    try prototype.*.constants.append(.{ .Number = 40 });
+    try prototype.*.chunk.append(bytecode.LOAD_CONST);
+    try prototype.*.chunk.append(0x0);
+    try prototype.*.chunk.append(0x0);
     try prototype.*.chunk.append(bytecode.CLOSURE);
     try prototype.*.chunk.append(0x0);
     try prototype.*.chunk.append(0x0);
     try prototype.*.chunk.append(bytecode.CALL);
-    try prototype.*.chunk.append(0x2);
+    try prototype.*.chunk.append(0x1);
+    try prototype.*.chunk.append(bytecode.STORE_0);
+    try prototype.*.chunk.append(bytecode.LOAD_CONST);
+    try prototype.*.chunk.append(0x0);
+    try prototype.*.chunk.append(0x1);
+    try prototype.*.chunk.append(bytecode.LOAD_0);
+    try prototype.*.chunk.append(bytecode.CALL);
+    try prototype.*.chunk.append(0x1);
     try prototype.*.chunk.append(bytecode.RETURN);
 
     const proto_add = value.Prototype.init(allocator);
@@ -296,5 +441,5 @@ test "aaaa" {
 
     const continuation = try vm.run(&stack);
     const last = stack.pop();
-    std.debug.print("{} with last = {}\n", .{ continuation, last.get_int() });
+    std.debug.print("{} with last = {}\n", .{ continuation, last.get_f64() });
 }

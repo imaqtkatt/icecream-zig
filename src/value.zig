@@ -7,7 +7,7 @@ const PAYLOAD: u64 = (1 << (51 - TAG_BITS)) - 1;
 const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 const INT_MASK: u64 = 0x0000_0000_FFFF_FFFF;
 
-pub const Value = packed struct {
+pub const Value = packed struct(u64) {
     raw: u64,
 
     const TAG_INT: u64 = 0x7FF9_0000_0000_0000;
@@ -70,11 +70,28 @@ pub const Value = packed struct {
     pub fn get_closure(value: Value) *Closure {
         return @ptrFromInt(value.raw & PAYLOAD);
     }
+
+    pub fn new_partial(partial: *Partial) Value {
+        return Value{ .raw = TAG_PARTIAL | @intFromPtr(partial) };
+    }
+
+    pub fn is_partial(value: Value) bool {
+        return value.raw & TAG_MASK == TAG_PARTIAL;
+    }
+
+    pub fn get_partial(value: Value) *Partial {
+        return @ptrFromInt(value.raw & PAYLOAD);
+    }
+};
+
+pub const Constant = union(enum) {
+    Number: f64,
 };
 
 pub const Prototype = struct {
     arity: u8,
     locals: u16,
+    constants: std.ArrayList(Constant),
     prototypes: std.ArrayList(*Prototype),
     chunk: std.ArrayList(u8),
 
@@ -83,6 +100,7 @@ pub const Prototype = struct {
         proto.* = Prototype{
             .arity = 0,
             .locals = 0,
+            .constants = std.ArrayList(Constant).init(allocator),
             .prototypes = std.ArrayList(*Prototype).init(allocator),
             .chunk = std.ArrayList(u8).init(allocator),
         };
@@ -93,6 +111,7 @@ pub const Prototype = struct {
         for (self.prototypes.items) |item| {
             item.deinit(allocator);
         }
+        self.constants.deinit();
         self.prototypes.deinit();
         self.chunk.deinit();
         allocator.destroy(self);
